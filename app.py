@@ -4,6 +4,7 @@ import os
 from PIL import Image
 import google.generativeai as genai
 import io
+import auth_functions
 
 # Load environment variables
 dotenv_path = os.path.join(os.getcwd(), '.env')
@@ -19,6 +20,29 @@ def get_gemini_response(input_text, image=None):
     else:
         response = model.generate_content([input_text, image])
     return response.text
+
+# ------------------- AUTH -------------------
+if 'user_info' not in st.session_state:
+    col1, col2, col3 = st.columns([1,2,1])
+    auth_form = col2.form(key='auth_form', clear_on_submit=False)
+    email = auth_form.text_input('Email')
+    password = auth_form.text_input('Password', type='password')
+    auth_notification = col2.empty()
+    if auth_form.form_submit_button('Sign In', use_container_width=True, type='primary'):
+        with auth_notification, st.spinner('Signing in'):
+            auth_functions.sign_in(email, password)
+    if 'auth_success' in st.session_state:
+        auth_notification.success(st.session_state.auth_success)
+        del st.session_state.auth_success
+    elif 'auth_warning' in st.session_state:
+        auth_notification.warning(st.session_state.auth_warning)
+        del st.session_state.auth_warning
+    st.stop()
+else:
+    st.sidebar.write(f"Signed in as: {st.session_state.user_info.get('email', 'User')}")
+    if st.sidebar.button('Sign Out', type='primary'):
+        auth_functions.sign_out()
+        st.rerun()
 
 st.title('Invoice Extraction using Google Gemini')
 st.write('Upload an invoice (image or PDF) and ask questions about the extracted content.')
