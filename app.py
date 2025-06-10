@@ -1,16 +1,12 @@
 import streamlit as st
-from dotenv import load_dotenv
-import os
 from PIL import Image
 import google.generativeai as genai
 import io
 import auth_functions
 
-# Load environment variables
-dotenv_path = os.path.join(os.getcwd(), '.env')
-load_dotenv(dotenv_path)
 # Configure Google Gemini
-genai.configure(api_key=os.getenv('GOOGLE_API_KEY'))
+api_key = st.secrets["GOOGLE_API_KEY"]
+genai.configure(api_key=api_key)
 
 model = genai.GenerativeModel('gemini-2.5-pro-preview-06-05')
 
