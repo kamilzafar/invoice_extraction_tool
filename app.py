@@ -44,17 +44,9 @@ if upload_files:
 if doc_type == "Vendor Bill":
     input_prompt = "You are an expert in understanding invoices. Extract the following fields as a table with columns: Date, Invoice Number, Item, Amount, Total Amount, GST/ Sales tax, Vendor, Customer. Output only the table in CSV format."
     columns = ["Date", "Invoice Number", "Item", "Amount", "Total Amount", "GST/ Sales tax", "Vendor", "Customer"]
-else:
-    input_prompt = (
-        "You are an expert in understanding bank statements (images or documents). "
-        "Extract only the transactions as a table with columns: Date, Description, Debit, Credit, Balance. "
-        "Output only the table in CSV format. "
-        "For any transaction where the Description contains the word 'Deposit' (such as 'ABM Deposit', 'Direct Deposit', etc), "
-        "the amount must always be placed in the Credit column, not Debit. "
-        "If the extracted value for a Deposit is in the Debit column, move it to Credit and leave Debit empty. "
-        "Make sure to get all the data from the document, including all transactions, and output it in CSV format."
-    )
-    columns = ["Date", "Description", "Debit", "Credit", "Balance"]
+elif doc_type == "Bank Statement":
+    input_prompt = "convert this bank statement to excel with col date, description, amount paid, amount received and balance"
+    columns = ["Date", "Description", "Amount Paid", "Amount Received", "Balance"]
 
 if st.button('Extract Information'):
     import pandas as pd
@@ -81,15 +73,47 @@ if st.button('Extract Information'):
             df = df[[col for col in columns if col in df.columns]]
         except Exception:
             lines = [line for line in response_clean.split('\n') if line.strip()]
-            data = []
+            # --- Improved Markdown table extraction ---
+            table_lines = []
+            in_table = False
             for line in lines:
-                row = re.split(r'\t|\|\|,', line)
-                if len(row) == len(columns):
-                    data.append([cell.strip() for cell in row])
-            if data:
-                df = pd.DataFrame(data, columns=columns)
+                if line.strip().startswith('|'):
+                    in_table = True
+                    table_lines.append(line)
+                elif in_table:
+                    break  # Stop at first non-table line after table started
+            # Remove alignment row (---)
+            table_lines = [l for l in table_lines if not set(l.replace('|','').strip()) <= set('-: ')]
+            if len(table_lines) > 1:
+                data = [[cell.strip() for cell in row.strip('|').split('|')] for row in table_lines]
+                df = pd.DataFrame(data[1:], columns=[c.strip().replace(' ($)', '').replace('(', '').replace(')', '') for c in data[0]])
+                # --- Ensure only the expected columns are kept, and rename if needed ---
+                col_map = {c: c for c in columns}
+                for c in df.columns:
+                    c_norm = c.lower().replace(' ', '').replace('$','')
+                    if c_norm == 'amountpaid':
+                        col_map[c] = 'Amount Paid'
+                    elif c_norm == 'amountreceived':
+                        col_map[c] = 'Amount Received'
+                    elif c_norm == 'date':
+                        col_map[c] = 'Date'
+                    elif c_norm == 'description':
+                        col_map[c] = 'Description'
+                    elif c_norm == 'balance':
+                        col_map[c] = 'Balance'
+                df = df.rename(columns=col_map)
+                df = df[[col for col in columns if col in df.columns]]
             else:
-                df = pd.DataFrame({"Gemini Output": [response_clean]})
+                # Fallback: try manual split
+                data = []
+                for line in lines:
+                    row = re.split(r'\t|,', line)
+                    if len(row) == len(columns):
+                        data.append([cell.strip() for cell in row])
+                if data:
+                    df = pd.DataFrame(data, columns=columns)
+                else:
+                    df = pd.DataFrame({"Gemini Output": [response_clean]})
         if df is not None and not df.empty:
             df = df[~(df.apply(lambda row: all(str(row[col]).strip().lower() == col.strip().lower() for col in df.columns), axis=1))]
             df['Filename'] = fname
