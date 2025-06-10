@@ -1,127 +1,132 @@
-# app.py
 import streamlit as st
-import os
-import tempfile
+import pandas as pd
 from google.cloud import documentai_v1 as documentai
 from google.oauth2 import service_account
-import pandas as pd
+from google.cloud.documentai_toolbox import document as toolbox
+import json
+from PyPDF2 import PdfReader
+import io
 
-# ---- Setup Google Credentials ----
-creds_json = st.secrets["gcp_service_account"]
+# ---- SETUP: Fill these with your actual processor IDs ----
+INVOICE_PROCESSOR_ID = "5ef6485af5372708"  # e.g. 'xxx...'
+BANK_PROCESSOR_ID    = "c231f3dddeaa44ca"     # e.g. 'yyy...'
+
+# ---- Google Cloud Credentials ----
+creds_json = json.loads(st.secrets["gcp_service_account"])
 creds = service_account.Credentials.from_service_account_info(creds_json)
-
 project_id = creds.project_id
-location = "us"  # or use "eu" if your processor is in the EU
-vendor_processor_id = "YOUR_VENDOR_PROCESSOR_ID"  # Replace with your Invoice parser processor ID
-form_processor_id = "YOUR_FORM_PROCESSOR_ID"  # Replace with your general parser ID for bank statements
+location = "us"  # Or "eu", etc.
 
-# ---- Helpers ----
-def process_document(file_bytes, mime_type, processor_id):
-    client = documentai.DocumentUnderstandingServiceClient(credentials=creds)
-    name = f"projects/{project_id}/locations/{location}/processors/{processor_id}"
-    raw_document = documentai.RawDocument(content=file_bytes, mime_type=mime_type)
-    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
-    result = client.process_document(request=request)
-    return result.document
+# ---- Helper: Call Document AI ----
+def process_document(bytes_data, mime, proc_id, imageless=False):
+    client = documentai.DocumentProcessorServiceClient(credentials=creds)
+    name = client.processor_path(project_id, location, proc_id)
+    raw = documentai.RawDocument(content=bytes_data, mime_type=mime)
+    req = documentai.ProcessRequest(name=name, raw_document=raw, imageless_mode=imageless)
+    res = client.process_document(request=req)
+    return toolbox.Document.from_documentai_document(res.document)
 
-
-def extract_vendor_invoice_data(document):
-    data = {
-        "Date": "",
-        "Invoice Number": "",
-        "Item": [],
-        "Amount": [],
-        "Total Amount": "",
-        "GST/Sales Tax": [],
-        "Vendor": "",
-        "Customer": ""
-    }
-
-    for entity in document.entities:
-        key = entity.type_.lower()
-        val = entity.mention_text
-
-        if "invoice_id" in key:
-            data["Invoice Number"] = val
-        elif "invoice_date" in key:
-            data["Date"] = val
-        elif "supplier" in key:
-            data["Vendor"] = val
-        elif "customer" in key:
-            data["Customer"] = val
-        elif "total_amount" in key:
-            data["Total Amount"] = val
-        elif "line_item" in key and entity.properties:
-            item, amount, gst = "", "", ""
+# ---- Helper: Extract fields for Vendor Bills ----
+def extract_vendor(wd: toolbox.Document) -> pd.DataFrame:
+    inv = wd.search_entities("invoice_id")
+    date = wd.search_entities("invoice_date")
+    sup = wd.search_entities("supplier_name")
+    cust = wd.search_entities("customer_name")
+    total = wd.search_entities("total_amount")
+    # Extract line items
+    items = []
+    for entity in wd.entities:
+        if entity.type_ == "line_item":
+            item = {
+                "Item": "",
+                "Amount": "",
+                "GST/Sales Tax": ""
+            }
             for prop in entity.properties:
-                if "description" in prop.type_.lower():
-                    item = prop.mention_text
-                elif "unit_price" in prop.type_.lower():
-                    amount = prop.mention_text
-                elif "tax_amount" in prop.type_.lower():
-                    gst = prop.mention_text
-            data["Item"].append(item)
-            data["Amount"].append(amount)
-            data["GST/Sales Tax"].append(gst)
+                if prop.type_ == "item_description":
+                    item["Item"] = prop.mention_text
+                elif prop.type_ == "unit_price":
+                    item["Amount"] = prop.mention_text
+                elif prop.type_ == "tax_amount":
+                    item["GST/Sales Tax"] = prop.mention_text
+            items.append(item)
+    df = pd.DataFrame(items)
+    df["Date"] = date[0].mention_text if date else ""
+    df["Invoice Number"] = inv[0].mention_text if inv else ""
+    df["Total Amount"] = total[0].mention_text if total else ""
+    df["Vendor"] = sup[0].mention_text if sup else ""
+    df["Customer"] = cust[0].mention_text if cust else ""
+    columns = ["Date", "Invoice Number", "Item", "Amount", "GST/Sales Tax", "Total Amount", "Vendor", "Customer"]
+    for col in columns:
+        if col not in df.columns:
+            df[col] = ""
+    return df[columns]
 
-    return pd.DataFrame({
-        "Date": [data["Date"]] * len(data["Item"]),
-        "Invoice Number": [data["Invoice Number"]] * len(data["Item"]),
-        "Item": data["Item"],
-        "Amount": data["Amount"],
-        "Total Amount": [data["Total Amount"]] * len(data["Item"]),
-        "GST/Sales Tax": data["GST/Sales Tax"],
-        "Vendor": [data["Vendor"]] * len(data["Item"]),
-        "Customer": [data["Customer"]] * len(data["Item"])
-    })
-
-
-def extract_bank_statement_data(document):
+# ---- Helper: Extract fields for Bank Statements ----
+def extract_bank(wd: toolbox.Document) -> pd.DataFrame:
     rows = []
-    for page in document.pages:
+    for page in wd.pages:
         for table in page.tables:
-            headers = [cell.layout.text.lower() for cell in table.header_rows[0].cells]
+            headers = [cell.layout.text.strip().title() for cell in table.header_rows[0].cells]
             for row in table.body_rows:
                 row_data = [cell.layout.text for cell in row.cells]
                 row_dict = dict(zip(headers, row_data))
                 rows.append(row_dict)
-
     df = pd.DataFrame(rows)
-    df = df.rename(columns=lambda x: x.strip().title())
-    keep_cols = ["Date", "Description", "Debit", "Credit", "Balance"]
-    df = df[[col for col in keep_cols if col in df.columns]]
-    return df
-
+    cols = ["Date", "Description", "Debit", "Credit", "Balance"]
+    for col in cols:
+        if col not in df.columns:
+            df[col] = ""
+    return df[cols]
 
 # ---- Streamlit UI ----
-st.set_page_config(page_title="Document Type Extractor", layout="centered")
-st.title("📑 AI-Powered Document Extractor")
+st.set_page_config(page_title="Batch AI Document Extractor", layout="wide")
+st.title("📁 Batch Upload & AI Extraction")
 
-uploaded_files = st.file_uploader("Upload one or more documents (PDF/Image)", type=["pdf", "png", "jpg", "jpeg"], accept_multiple_files=True)
+files = st.file_uploader(
+    "Upload one or more documents (PDF, PNG, JPG, JPEG)", 
+    type=["pdf", "png", "jpg", "jpeg"], 
+    accept_multiple_files=True
+)
 
-doc_type = st.radio("What type of document are these?", ["Vendor Bill", "Bank Statement"])
+doc_type = st.radio("Select document type", ["Vendor Bill", "Bank Statement"], horizontal=True)
 
-if uploaded_files:
-    processor_id = vendor_processor_id if doc_type == "Vendor Bill" else form_processor_id
-    all_data = []
-
-    with st.spinner("Processing all documents with Google Document AI..."):
-        for uploaded_file in uploaded_files:
-            mime = uploaded_file.type
-            file_bytes = uploaded_file.read()
-            try:
-                doc = process_document(file_bytes, mime, processor_id)
-                if doc_type == "Vendor Bill":
-                    df = extract_vendor_invoice_data(doc)
-                else:
-                    df = extract_bank_statement_data(doc)
-                all_data.append(df)
-            except Exception as e:
-                st.warning(f"Failed to process {uploaded_file.name}: {e}")
-
-    if all_data:
-        final_df = pd.concat(all_data, ignore_index=True)
-        st.success("✅ All files processed successfully!")
-        st.dataframe(final_df)
-
-        st.download_button("📥 Download Excel File", final_df.to_excel(index=False), file_name="extracted_batch.xlsx")
+if files:
+    proc_id = INVOICE_PROCESSOR_ID if doc_type == "Vendor Bill" else BANK_PROCESSOR_ID
+    if st.button("Start Extraction", type="primary"):
+        all_dfs = []
+        with st.spinner("Processing documents..."):
+            for f in files:
+                try:
+                    # -- Detect number of pages for PDFs
+                    imageless = False
+                    num_pages = None
+                    if f.type == "application/pdf":
+                        pdf_bytes = f.read()
+                        pdf_stream = io.BytesIO(pdf_bytes)
+                        reader = PdfReader(pdf_stream)
+                        num_pages = len(reader.pages)
+                        f.seek(0)  # Reset file pointer for next read
+                        if num_pages > 30:
+                            st.error(f"❌ {f.name} has {num_pages} pages. Google Document AI sync mode only supports up to 30 pages. Please split the file.")
+                            continue
+                        elif num_pages > 15:
+                            imageless = True
+                            st.warning(f"⚠️ {f.name} has {num_pages} pages. Using imageless mode (up to 30 pages per doc).")
+                        wrapped = process_document(pdf_bytes, f.type, proc_id, imageless=imageless)
+                    else:
+                        wrapped = process_document(f.read(), f.type, proc_id, imageless=False)
+                    df = extract_vendor(wrapped) if doc_type == "Vendor Bill" else extract_bank(wrapped)
+                    df["Filename"] = f.name
+                    all_dfs.append(df)
+                except Exception as e:
+                    st.error(f"⚠️ Error processing {f.name}: {e}")
+        if all_dfs:
+            result = pd.concat(all_dfs, ignore_index=True)
+            st.success(f"Processed {len(all_dfs)} files — {len(result)} rows extracted.")
+            st.dataframe(result)
+            # Write Excel to bytes for download
+            excel_bytes = io.BytesIO()
+            result.to_excel(excel_bytes, index=False)
+            excel_bytes.seek(0)
+            st.download_button("📥 Download All Results as Excel", excel_bytes, "extracted_data.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
