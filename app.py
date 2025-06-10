@@ -42,7 +42,7 @@ if upload_files:
             st.info(f'PDF uploaded: {upload_file.name}. The file will be sent to Gemini for extraction.')
 
 if doc_type == "Vendor Bill":
-    input_prompt = "You are an expert in understanding invoices. Extract the following fields as a table with columns: Date, Invoice Number, Item, Amount, Total Amount, GST/ Sales tax, Vendor, Customer. Output only the table in CSV format."
+    input_prompt = "You are an expert in understanding invoices. Extract the invoice as a table with columns: Date, Invoice Number, Item, Amount, Total Amount, GST/ Sales tax, Vendor, Customer. Output ONLY the table in CSV format, with the first row as the header. Do not include any explanations, summaries, or extra text."
     columns = ["Date", "Invoice Number", "Item", "Amount", "Total Amount", "GST/ Sales tax", "Vendor", "Customer"]
 elif doc_type == "Bank Statement":
     input_prompt = "convert this bank statement to excel with col date, description, amount paid, amount received and balance"
